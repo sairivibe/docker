@@ -1,0 +1,126 @@
+name: Docker
+
+on:
+  schedule:
+    - cron: '22 4 * * *'
+  push:
+    branches: [ main ]
+    tags: [ 'v*.*.*' ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch: {}
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  test:
+    name: Build & Run Test (Nginx + PHP-FPM)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Build image (local, tidak di-push)
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          push: false
+          load: true
+          tags: sairi-test:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Jalankan container untuk test
+        run: |
+          docker run -d --name sairi-test \
+            -e ENABLE_PHP_WEB=true \
+            -e SERVER_PORT=8080 \
+            -p 8080:8080 \
+            sairi-test:latest tail -f /dev/null
+
+      - name: Tunggu Nginx + PHP-FPM siap
+        run: |
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:8080/ -o /tmp/response.html; then
+              echo "Server merespons pada percobaan ke-$i"
+              break
+            fi
+            echo "Belum siap, coba lagi... ($i/30)"
+            sleep 2
+          done
+
+      - name: Verifikasi output PHP-FPM aktif
+        run: |
+          if ! grep -qi "phpinfo\|PHP Version" /tmp/response.html; then
+            echo "::error::Response tidak mengandung output PHP. Nginx atau PHP-FPM gagal jalan."
+            echo "--- Isi response ---"
+            cat /tmp/response.html || true
+            echo "--- Log container ---"
+            docker exec sairi-test sh -c 'cat /home/container/logs/*.log 2>/dev/null || true'
+            exit 1
+          fi
+          echo "PHP-FPM + Nginx berhasil merespons dengan benar."
+
+      - name: Tampilkan status proses di dalam container
+        if: always()
+        run: |
+          docker exec sairi-test sh -c 'pgrep -af "nginx|php-fpm|supervisord" || echo "Tidak ada proses ditemukan"'
+
+      - name: Tampilkan log jika gagal
+        if: failure()
+        run: |
+          docker logs sairi-test || true
+          docker exec sairi-test sh -c 'cat /home/container/logs/*.log 2>/dev/null || true'
+
+      - name: Bersihkan container test
+        if: always()
+        run: docker rm -f sairi-test || true
+
+  build:
+    name: Build & Push Image
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Log into registry ${{ env.REGISTRY }}
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v4
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+
+      - name: Build and push Docker image
+        id: build-and-push
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
